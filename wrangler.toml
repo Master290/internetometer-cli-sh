@@ -1,0 +1,7 @@
+name = "internetometer-sh"
+main = "src/index.js"
+compatibility_date = "2026-04-05"
+
+routes = [
+  { pattern = "speed.dev.tatar/*", zone_name = "dev.tatar" }
+]
