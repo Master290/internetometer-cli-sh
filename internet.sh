@@ -1,0 +1,640 @@
+#!/usr/bin/env bash
+
+set -u
+
+USER_AGENT='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+BASE_URL_RU='https://yandex.ru/internet'
+BASE_URL_EN='https://yandex.com/internet'
+IPV4_URL='https://ipv4-internet.yandex.net/api/v0/ip'
+IPV6_URL='https://ipv6-internet.yandex.net/api/v0/ip'
+PROBES_URL='https://yandex.ru/internet/api/v0/get-probes'
+TARGET_DURATION=8
+UPLOAD_SIZE=$((50 * 1024 * 1024))
+
+show_ip=false
+show_speed=false
+show_full=false
+as_json=false
+lang='en'
+concurrency=4
+save_path=''
+debug=false
+use_tui=false
+timeout='60s'
+
+ipv4=''
+ipv6=''
+region=''
+isp_name=''
+isp_asn=''
+download_mbps=''
+upload_mbps=''
+latency_ms=''
+os_name=''
+arch_name=''
+num_cpu=''
+time_now=''
+
+usage() {
+  cat <<'EOF'
+Usage: ./internetometer.sh [flags]
+
+Flags:
+  --ip               Show IPv4 and IPv6
+  --speed            Run speed test
+  --all              Show full info
+  --json             Output JSON
+  --lang en|ru       Region language
+  --concurrency N    Parallel speed connections
+  --save PATH        Append JSONL results to a file
+  --debug            Print probe URLs and HTTP response details
+  --tui              Not implemented in bash version
+  --timeout DUR      Per-request timeout, for example 60s or 2m
+  -h, --help         Show this help
+EOF
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+debug_log() {
+  if $debug; then
+    printf '%s\n' "$*" >&2
+  fi
+}
+
+parse_duration_seconds() {
+  local input="$1"
+  case "$input" in
+    '' ) echo 60 ;;
+    *[!0-9smh.]*) die "Invalid timeout: $input" ;;
+    *h)
+      python3 - "$input" <<'PY'
+import sys
+value = sys.argv[1]
+print(float(value[:-1]) * 3600)
+PY
+      ;;
+    *m)
+      python3 - "$input" <<'PY'
+import sys
+value = sys.argv[1]
+print(float(value[:-1]) * 60)
+PY
+      ;;
+    *s)
+      python3 - "$input" <<'PY'
+import sys
+value = sys.argv[1]
+print(float(value[:-1]))
+PY
+      ;;
+    *)
+      python3 - "$input" <<'PY'
+import sys
+print(float(sys.argv[1]))
+PY
+      ;;
+  esac
+}
+
+http_get() {
+  local url="$1"
+  curl -L -fsS --max-time "$timeout_seconds" -A "$USER_AGENT" "$url"
+}
+
+fetch_ipv4() {
+  ipv4="$(http_get "$IPV4_URL" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()))')"
+}
+
+fetch_ipv6() {
+  ipv6="$(http_get "$IPV6_URL" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()))')" || ipv6=''
+}
+
+fetch_region() {
+  local base_url="$BASE_URL_RU"
+  if [[ "$lang" == "en" ]]; then
+    base_url="$BASE_URL_EN"
+  fi
+
+  local body
+  body="$(http_get "$base_url")" || return 1
+
+  region="$(printf '%s' "$body" | python3 -c '
+import json
+import re
+import sys
+
+body = sys.stdin.read()
+match = re.search(r"\"clientRegion\":({[^}]*})", body)
+if not match:
+    print("Unknown")
+    raise SystemExit(0)
+
+try:
+    info = json.loads(match.group(1))
+except Exception:
+    print("Unknown")
+    raise SystemExit(0)
+
+print(info.get("name", "Unknown"))
+')"
+}
+
+fetch_isp() {
+  local body
+  body="$(http_get "$BASE_URL_RU")" || return 1
+
+  IFS=$'\n' read -r isp_name isp_asn <<<"$(printf '%s' "$body" | python3 -c '
+import re
+import sys
+
+body = sys.stdin.read()
+name = ""
+asn = ""
+
+match = re.search(r"\"asn\":\[(\d+)\]", body)
+if match:
+    asn = match.group(1)
+
+match = re.search(r"\"operatorName\":\"([^\"]*)\"", body)
+if match:
+    name = match.group(1)
+
+if not name and asn:
+    name = f"AS{asn}"
+
+print(name)
+print(asn)
+')"
+}
+
+fetch_probes() {
+  http_get "$PROBES_URL"
+}
+
+choose_download_probe() {
+  python3 -c '
+import json
+import re
+import sys
+
+data = json.load(sys.stdin)
+probes = data.get("download", {}).get("probes", [])
+target = None
+
+for probe in probes:
+    url = probe.get("url", "")
+    if not url:
+        continue
+    if target is None or "100kb" not in url:
+        target = probe
+        if "50mb" in url:
+            break
+
+if target is None and probes:
+    target = probes[0]
+
+if target and target.get("url"):
+    print(target["url"])
+'
+}
+
+choose_upload_probe() {
+  python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+probes = data.get("upload", {}).get("probes", [])
+if probes and probes[0].get("url"):
+    print(probes[0]["url"])
+'
+}
+
+measure_latency_ms() {
+  local probes_json="$1"
+  python3 -c '
+import json
+import subprocess
+import sys
+
+payload = json.load(sys.stdin)
+timeout = sys.argv[1]
+ua = sys.argv[2]
+probes = payload.get("latency", {}).get("probes", [])
+best = None
+
+for _ in range(3):
+    for probe in probes:
+        url = probe.get("url", "")
+        if not url:
+            continue
+        cmd = [
+            "curl",
+            "-L",
+            "-fsS",
+            "--max-time",
+            timeout,
+            "-A",
+            ua,
+            "-e",
+            "https://yandex.ru/internet",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{time_total}\\n",
+            url,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            continue
+        try:
+            value = float(proc.stdout.strip())
+        except ValueError:
+            continue
+        if best is None or value < best:
+            best = value
+
+if best is None:
+    sys.exit(1)
+
+print(int(best * 1000))
+' "$timeout_seconds" "$USER_AGENT" <<<"$probes_json"
+}
+
+run_speed_test() {
+  local probes_json download_url upload_url
+  probes_json="$(fetch_probes)" || return 1
+  download_url="$(printf '%s' "$probes_json" | choose_download_probe)"
+  upload_url="$(printf '%s' "$probes_json" | choose_upload_probe)"
+
+  if [[ -z "$download_url" || -z "$upload_url" ]]; then
+    return 1
+  fi
+
+  debug_log "download probe: $download_url"
+  debug_log "upload probe:   $upload_url"
+
+  local latency_value
+  latency_value="$(measure_latency_ms "$probes_json" || true)"
+  latency_ms="${latency_value:-}"
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local download_tmp upload_tmp
+  download_tmp="$tmpdir/download"
+  upload_tmp="$tmpdir/upload"
+  : >"$download_tmp"
+  : >"$upload_tmp"
+
+  worker_download() {
+    local deadline_ns="$1"
+    local probe_url="$2"
+    local output_file="$3"
+    local total=0 now_ns http_code size_download raw_output curl_status
+    while :; do
+      now_ns="$(date +%s%N)"
+      [[ "$now_ns" -ge "$deadline_ns" ]] && break
+
+      raw_output="$(
+        curl -L -sS --max-time "$timeout_seconds" \
+          -A "$USER_AGENT" \
+          -e 'https://yandex.ru/' \
+          -o /dev/null \
+          -w '%{http_code}\t%{size_download}' \
+          "$probe_url"
+      )"
+      curl_status=$?
+      debug_log "[download] status=$curl_status raw=$raw_output"
+      (( curl_status == 0 )) || continue
+      IFS=$'\t' read -r http_code size_download <<<"$raw_output"
+      [[ -n "$http_code" && -n "$size_download" ]] || continue
+
+      debug_log "[download] code=$http_code bytes=${size_download%.*}"
+      [[ "$http_code" == "200" ]] || continue
+      total=$((total + ${size_download%.*}))
+    done
+    printf '%s\n' "$total" >"$output_file.$BASHPID"
+  }
+
+  worker_upload() {
+    local deadline_ns="$1"
+    local probe_url="$2"
+    local output_file="$3"
+    local total=0 now_ns http_code size_upload raw_output curl_status
+    while :; do
+      now_ns="$(date +%s%N)"
+      [[ "$now_ns" -ge "$deadline_ns" ]] && break
+
+      raw_output="$(
+        head -c "$UPLOAD_SIZE" /dev/zero | curl -L -sS --max-time "$timeout_seconds" \
+          -A "$USER_AGENT" \
+          -e 'https://yandex.ru/internet' \
+          -H 'Origin: https://yandex.ru' \
+          -H 'Accept: */*' \
+          -H 'Sec-Fetch-Mode: cors' \
+          -H 'Sec-Fetch-Site: cross-site' \
+          -H 'Sec-Fetch-Dest: empty' \
+          -X POST \
+          --data-binary @- \
+          -o /dev/null \
+          -w '%{http_code}\t%{size_upload}' \
+          "$probe_url"
+      )"
+      curl_status=$?
+      debug_log "[upload]   status=$curl_status raw=$raw_output"
+      (( curl_status == 0 )) || continue
+      IFS=$'\t' read -r http_code size_upload <<<"$raw_output"
+      [[ -n "$http_code" && -n "$size_upload" ]] || continue
+
+      debug_log "[upload]   code=$http_code bytes=${size_upload%.*}"
+      [[ "$http_code" == "200" ]] || continue
+      total=$((total + ${size_upload%.*}))
+    done
+    printf '%s\n' "$total" >"$output_file.$BASHPID"
+  }
+
+  local i
+  local download_start_ns download_end_ns download_duration_sec
+  download_start_ns="$(date +%s%N)"
+  local download_deadline_ns=$((download_start_ns + TARGET_DURATION * 1000000000))
+  for ((i = 0; i < concurrency; i++)); do
+    worker_download "$download_deadline_ns" "$download_url" "$download_tmp" &
+  done
+  wait
+
+  local total_read=0 file
+  for file in "$download_tmp".*; do
+    [[ -f "$file" ]] || continue
+    total_read=$((total_read + $(<"$file")))
+  done
+
+  download_end_ns="$(date +%s%N)"
+  download_duration_sec="$(python3 - "$download_start_ns" "$download_end_ns" <<'PY'
+import sys
+start = int(sys.argv[1])
+end = int(sys.argv[2])
+print(max((end - start) / 1_000_000_000, 0.001))
+PY
+)"
+
+  local upload_start_ns upload_end_ns upload_duration_sec
+  upload_start_ns="$(date +%s%N)"
+  local upload_deadline_ns=$((upload_start_ns + TARGET_DURATION * 1000000000))
+  for ((i = 0; i < concurrency; i++)); do
+    worker_upload "$upload_deadline_ns" "$upload_url" "$upload_tmp" &
+  done
+
+  wait
+
+  local total_written=0
+  for file in "$upload_tmp".*; do
+    [[ -f "$file" ]] || continue
+    total_written=$((total_written + $(<"$file")))
+  done
+
+  upload_end_ns="$(date +%s%N)"
+  upload_duration_sec="$(python3 - "$upload_start_ns" "$upload_end_ns" <<'PY'
+import sys
+start = int(sys.argv[1])
+end = int(sys.argv[2])
+print(max((end - start) / 1_000_000_000, 0.001))
+PY
+)"
+
+  download_mbps="$(python3 - "$total_read" "$download_duration_sec" <<'PY'
+import sys
+total = float(sys.argv[1])
+duration = float(sys.argv[2])
+print((total * 8) / (duration * 1_000_000))
+PY
+)"
+  upload_mbps="$(python3 - "$total_written" "$upload_duration_sec" <<'PY'
+import sys
+total = float(sys.argv[1])
+duration = float(sys.argv[2])
+print((total * 8) / (duration * 1_000_000))
+PY
+)"
+}
+
+print_text() {
+  printf '%s\n' '--- Yandex Internetometer CLI ---'
+  if [[ -n "$ipv4" ]]; then
+    printf 'IPv4: %s\n' "$ipv4"
+  fi
+  if [[ -n "$ipv6" ]]; then
+    printf 'IPv6: %s\n' "$ipv6"
+  elif [[ -n "$ipv4" ]]; then
+    printf 'IPv6: -\n'
+  fi
+  if [[ -n "$region" ]]; then
+    printf 'Region:   %s\n' "$region"
+  fi
+  if [[ -n "$isp_name" ]]; then
+    if [[ -n "$isp_asn" ]]; then
+      printf 'ISP:      %s (AS%s)\n' "$isp_name" "$isp_asn"
+    else
+      printf 'ISP:      %s\n' "$isp_name"
+    fi
+  fi
+  if [[ -n "$download_mbps" ]]; then
+    printf 'Download: %.2f Mbps\n' "$download_mbps"
+  fi
+  if [[ -n "$upload_mbps" ]]; then
+    printf 'Upload:   %.2f Mbps\n' "$upload_mbps"
+  fi
+  if [[ -n "$latency_ms" ]]; then
+    printf 'Latency:  %s ms\n' "$latency_ms"
+  fi
+  if [[ -n "$os_name" ]]; then
+    printf 'OS:       %s (%s)\n' "$os_name" "$arch_name"
+  fi
+  if [[ -n "$time_now" ]]; then
+    printf 'Time:     %s\n' "$time_now"
+  fi
+}
+
+emit_json() {
+  python3 - <<'PY'
+import json
+import os
+
+result = {}
+for key in (
+    "ipv4",
+    "ipv6",
+    "region",
+    "isp_name",
+    "isp_asn",
+    "download_mbps",
+    "upload_mbps",
+    "latency_ms",
+    "os_name",
+    "arch_name",
+    "num_cpu",
+    "time_now",
+):
+    value = os.environ.get(key, "")
+    if value == "":
+        continue
+    if key == "isp_name":
+        result["isp"] = value
+    elif key == "isp_asn":
+        result["asn"] = int(value)
+    elif key == "os_name":
+        result["os"] = value
+    elif key == "arch_name":
+        result["arch"] = value
+    elif key == "num_cpu":
+        result["num_cpu"] = int(value)
+    elif key == "latency_ms":
+        result["latency_ms"] = int(float(value))
+    elif key in {"download_mbps", "upload_mbps"}:
+        result[key] = float(value)
+    else:
+        result[key] = value
+
+print(json.dumps(result, indent=2, ensure_ascii=False))
+PY
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ip) show_ip=true ;;
+      --speed) show_speed=true ;;
+      --all) show_full=true ;;
+      --json) as_json=true ;;
+      --lang)
+        shift
+        [[ $# -gt 0 ]] || die '--lang requires a value'
+        lang="$1"
+        ;;
+      --concurrency)
+        shift
+        [[ $# -gt 0 ]] || die '--concurrency requires a value'
+        concurrency="$1"
+        ;;
+      --save)
+        shift
+        [[ $# -gt 0 ]] || die '--save requires a value'
+        save_path="$1"
+        ;;
+      --debug) debug=true ;;
+      --tui) use_tui=true ;;
+      --timeout)
+        shift
+        [[ $# -gt 0 ]] || die '--timeout requires a value'
+        timeout="$1"
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *)
+        die "Unknown flag: $1"
+        ;;
+    esac
+    shift
+  done
+
+  timeout_seconds="$(parse_duration_seconds "$timeout")"
+  if ! [[ "$concurrency" =~ ^-?[0-9]+$ ]]; then
+    die "Invalid concurrency: $concurrency"
+  fi
+  if (( concurrency <= 0 )); then
+    concurrency=4
+  fi
+
+  if [[ "$use_tui" == true ]]; then
+    printf '%s\n' 'TUI is not implemented in the bash version; falling back to text mode.' >&2
+    show_full=true
+  fi
+
+  if ! $show_ip && ! $show_speed && ! $show_full && ! $as_json; then
+    show_full=true
+  fi
+
+  os_name="$(uname -s)"
+  arch_name="$(uname -m)"
+  num_cpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
+  time_now="$(date -Iseconds)"
+
+  if $show_ip || $show_full; then
+    if ! fetch_ipv4; then
+      printf 'Error getting IPv4\n' >&2
+    fi
+    fetch_ipv6 || true
+    fetch_region || true
+    fetch_isp || true
+  fi
+
+  if $show_speed || $show_full; then
+    if ! $as_json; then
+      printf '%s\n' 'Running speed test...' >&2
+    fi
+    if ! run_speed_test; then
+      printf '%s\n' 'Speed test failed.' >&2
+    fi
+  fi
+
+  if $as_json; then
+    export ipv4 ipv6 region isp_name isp_asn download_mbps upload_mbps latency_ms os_name arch_name num_cpu time_now
+    emit_json
+  else
+    print_text
+  fi
+
+  if [[ -n "$save_path" ]]; then
+    export ipv4 ipv6 region isp_name isp_asn download_mbps upload_mbps latency_ms os_name arch_name num_cpu time_now
+    python3 - <<'PY' >>"$save_path"
+import json
+import os
+
+result = {}
+for key in (
+    "ipv4",
+    "ipv6",
+    "region",
+    "isp_name",
+    "isp_asn",
+    "download_mbps",
+    "upload_mbps",
+    "latency_ms",
+    "os_name",
+    "arch_name",
+    "num_cpu",
+    "time_now",
+):
+    value = os.environ.get(key, "")
+    if value == "":
+        continue
+    if key == "isp_name":
+        result["isp"] = value
+    elif key == "isp_asn":
+        result["asn"] = int(value)
+    elif key == "os_name":
+        result["os"] = value
+    elif key == "arch_name":
+        result["arch"] = value
+    elif key == "num_cpu":
+        result["num_cpu"] = int(value)
+    elif key == "latency_ms":
+        result["latency_ms"] = int(float(value))
+    elif key in {"download_mbps", "upload_mbps"}:
+        result[key] = float(value)
+    else:
+        result[key] = value
+
+print(json.dumps(result, ensure_ascii=False))
+PY
+  fi
+}
+
+main "$@"
